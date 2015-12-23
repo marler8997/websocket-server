@@ -1,0 +1,35 @@
+<html><head>
+<meta content="text/html;charset=utf-8" http-equiv="Content-Type">
+<meta content="utf-8" http-equiv="encoding">
+<title>WebSocket Tester</title>
+<script type="text/javascript">
+
+var websock;
+
+function webSocketConnect()
+{
+  websock = new WebSocket("ws://" + document.getElementById('WebSocketHost').value + "/MyWebSocket", "custom_websocket_proto");
+  websock.onopen = function(e) {
+    console.log('web socket open');
+    websock.send("Test!");
+  };
+  websock.onclose = function(e) {
+    console.log('web socket closed (code=' + e.code + ') (reason=' +
+                e.reason + ')');
+  };
+  websock.onmessage = function(e) {
+    console.log('web socket message: ' + e.data);
+  };
+  websock.onerror = function(e) {
+    console.log('web socket error: ' + e.data);
+  }
+}
+function bodyOnload()
+{
+}
+
+</script>
+</head><body onload="bodyOnload()">
+<input type="text" id="WebSocketHost" value="localhost:81" />
+<button onclick="webSocketConnect()">Connect</button>
+</body></html>
