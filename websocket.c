@@ -12,7 +12,10 @@
 #include <net.h>
 
 #define using_more
-#include <sha1.h>
+#include <more/sha1.h>
+
+#include "websocketFrameParser.h"
+
 
 #define LOG_FATAL(fmt, ...) do {printf("FATAL: " fmt "\n",##__VA_ARGS__); fflush(stdout); }while(0)
 #define LOG_ERROR(fmt, ...) do {printf("ERROR: " fmt "\n",##__VA_ARGS__); fflush(stdout); }while(0)
@@ -26,7 +29,7 @@
 #define DATA_BUFFER_SIZE 1 // Use 1 for development to expose corner cases and bugs
 
 #define EVENT_BUFFER_COUNT 32
-#define HTTP_LISTEN_PORT 81
+#define HTTP_LISTEN_PORT 1080
 #define HTTP_BACKLOG 32
 //#define HTTP_PROCESS_BUFFER_SIZE 32 // Note: must be big enough to hold the biggest header that we are interested in
 #define HTTP_PROCESS_BUFFER_SIZE 24 // Note: must be big enough to hold the biggest header that we are interested in
@@ -58,50 +61,55 @@ typedef struct {
 typedef struct {
   EpollHandler handler; // must be the first field
   int sock;
-  http_parser httpParser;
 
+  union {
+    struct {
+      http_parser httpParser;
 
-  #define HTTP_PROCESS_STATE_URL           0
-  #define HTTP_PROCESS_STATE_HEADER_FIELD  1
+      #define HTTP_PROCESS_STATE_URL           0
+      #define HTTP_PROCESS_STATE_HEADER_FIELD  1
 
-  #define HTTP_PROCESS_STATE_HEADER_VALUE_FIRST         2
-  #define HTTP_PROCESS_STATE_HEADER_VALUE_GENERIC       2
-  #define HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY 3
-  #define HTTP_PROCESS_STATE_HEADER_VALUE_LAST          3
+      #define HTTP_PROCESS_STATE_HEADER_VALUE_FIRST         2
+      #define HTTP_PROCESS_STATE_HEADER_VALUE_GENERIC       2
+      #define HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY 3
+      #define HTTP_PROCESS_STATE_HEADER_VALUE_LAST          3
 
-  #define HTTP_PROCESS_STATE_BODY          4
-  byte state;
+      #define HTTP_PROCESS_STATE_BODY          4
+      byte state;
 
-  HttpProcessBuffer buf;
+      HttpProcessBuffer buf;
   
-  Sha1 sha;
+      Sha1 sha;
+    } http;
+
+    WebSocketFrameParser websocket;
+  } data;
 
 } HttpEpollHandler;
 
 void HttpEpollHandlerAdd(HttpEpollHandler* handler, const char* data, size_t len)
 {
-  size_t copySize = sizeof(handler->buf.array) - handler->buf.savedContentLength;
+  size_t copySize = sizeof(handler->data.http.buf.array) - handler->data.http.buf.savedContentLength;
   if(len <= copySize) {
     copySize = len;
   } else {
-    handler->buf.droppedContentLength += (len - copySize);
+    handler->data.http.buf.droppedContentLength += (len - copySize);
   }
   
   if(copySize > 0) {
-    memcpy(handler->buf.array + handler->buf.savedContentLength, data, copySize);
-    handler->buf.savedContentLength += copySize;
+    memcpy(handler->data.http.buf.array + handler->data.http.buf.savedContentLength, data, copySize);
+    handler->data.http.buf.savedContentLength += copySize;
     //LOG_DEBUG("HttpEpollHandlerAdd: %.*s", handler->contentLen, handler->buf);
   }
 }
 #define HttpEpollHandlerBufEquals(handler, literal)			\
-  (handler->buf.savedContentLength == sizeof(literal)-1 &&		\
-   memcmp(handler->buf.array, literal, sizeof(literal)-1) == 0)
+  (handler->data.http.buf.savedContentLength == sizeof(literal)-1 &&		\
+   memcmp(handler->data.http.buf.array, literal, sizeof(literal)-1) == 0)
 
 int epollfd;
 int httpListenSock;
 http_parser_settings httpParserSettings;
-char buf[DATA_BUFFER_SIZE];
-
+unsigned char buf[DATA_BUFFER_SIZE];
 
 void EncodeSha(ubyte* buffer, HttpEpollHandler* handler)
 {
@@ -109,10 +117,10 @@ void EncodeSha(ubyte* buffer, HttpEpollHandler* handler)
   int i;
   int sha1Off = 0;
   for(i = 0; i < 5; i++) {
-    sha1HashBytes[sha1Off++] = handler->sha.hash[i] >> 24;
-    sha1HashBytes[sha1Off++] = handler->sha.hash[i] >> 16;
-    sha1HashBytes[sha1Off++] = handler->sha.hash[i] >>  8;
-    sha1HashBytes[sha1Off++] = handler->sha.hash[i]      ;
+    sha1HashBytes[sha1Off++] = handler->data.http.sha.hash[i] >> 24;
+    sha1HashBytes[sha1Off++] = handler->data.http.sha.hash[i] >> 16;
+    sha1HashBytes[sha1Off++] = handler->data.http.sha.hash[i] >>  8;
+    sha1HashBytes[sha1Off++] = handler->data.http.sha.hash[i]      ;
   }
   base64Encode(sha1HashBytes, SHA1_HASH_BYTE_LENGTH, buffer);
 }
@@ -133,7 +141,15 @@ void WebSocketHandler(void* ptr)
     close(sock); // should be removed from epollfd automatically
     free(ptr);
   } else {
-    LOG_DEBUG("(s=%d) WebSocket got %d bytes", sock, received);
+    printf("(s=%d) WebSocket got %d bytes:", sock, received);
+    {
+      size_t i;
+      for(i = 0; i < received; i++) {
+	printf(" %02X", buf[i]);
+      }
+    }
+    printf("\n");
+    websocket_parseframe(&((HttpEpollHandler*)ptr)->data.websocket, buf, buf + received);
   }
 }
 
@@ -156,10 +172,10 @@ void HttpHeaderHandler(void* ptr)
     int parseLength;
 
     //LOG_DEBUG("Got %lu bytes from (s=%d)", received, sock);
-    parseLength = http_parser_execute(&((HttpEpollHandler*)ptr)->httpParser,
+    parseLength = http_parser_execute(&((HttpEpollHandler*)ptr)->data.http.httpParser,
 				      &httpParserSettings, buf, received);
 
-    if(((HttpEpollHandler*)ptr)->state == HTTP_PROCESS_STATE_BODY) {
+    if(((HttpEpollHandler*)ptr)->data.http.state == HTTP_PROCESS_STATE_BODY) {
       ssize_t sent;
       size_t toSend;
       ubyte response[1024];
@@ -189,7 +205,10 @@ void HttpHeaderHandler(void* ptr)
 	return;
       }
 
+      // TODO: Clean Up HTTP Parser and setup websocket parser
       ((HttpEpollHandler*)ptr)->handler = &WebSocketHandler;
+      memset(&((HttpEpollHandler*)ptr)->data.websocket, 0, sizeof(((HttpEpollHandler*)ptr)->data.websocket));
+      
       
     }
 
@@ -229,8 +248,8 @@ void HttpAcceptHandler(void* ptr)
 
   ((HttpEpollHandler*)epollEvent.data.ptr)->handler = &HttpHeaderHandler;
   ((HttpEpollHandler*)epollEvent.data.ptr)->sock    = newSock;
-  http_parser_init(&((HttpEpollHandler*)epollEvent.data.ptr)->httpParser, HTTP_REQUEST);
-  ((HttpEpollHandler*)epollEvent.data.ptr)->state   = HTTP_PROCESS_STATE_URL;
+  http_parser_init(&((HttpEpollHandler*)epollEvent.data.ptr)->data.http.httpParser, HTTP_REQUEST);
+  ((HttpEpollHandler*)epollEvent.data.ptr)->data.http.state   = HTTP_PROCESS_STATE_URL;
   //sha1Init(&((HttpEpollHandler*)epollEvent.data.ptr)->sha);
   
   epollEvent.events   = EPOLLIN;
@@ -243,7 +262,8 @@ void HttpAcceptHandler(void* ptr)
 static const EpollHandler httpAcceptHandlerPtr = &HttpAcceptHandler;
 
 
-#define PARSER_PTR_TO_HANDLER_PTR(parser) (HttpEpollHandler*)((char*)(parser) - offsetof(HttpEpollHandler, httpParser))
+//#define PARSER_PTR_TO_HANDLER_PTR(parser) (HttpEpollHandler*)((char*)(parser) - offsetof(HttpEpollHandler, httpParser))
+#define PARSER_PTR_TO_HANDLER_PTR(parser) (HttpEpollHandler*)((char*)(parser) - offsetof(HttpEpollHandler, data))
 
 
 int httpParserOnMessageBegin(http_parser* parser)
@@ -261,8 +281,8 @@ int httpParserOnUrl(http_parser* parser, const char* at, size_t length)
 
   //LOG_DEBUG("http-parser: url '%.*s'", (int)length, at);
 
-  if(handler->state != HTTP_PROCESS_STATE_URL) {
-    LOG_ERROR("at url callback but current state is %d", handler->state);
+  if(handler->data.http.state != HTTP_PROCESS_STATE_URL) {
+    LOG_ERROR("at url callback but current state is %d", handler->data.http.state);
     return 1;
   }
 
@@ -272,32 +292,32 @@ int httpParserOnUrl(http_parser* parser, const char* at, size_t length)
 
 int handleState0(HttpEpollHandler* handler, int newState)
 {
-  if(handler->state == HTTP_PROCESS_STATE_URL) {
+  if(handler->data.http.state == HTTP_PROCESS_STATE_URL) {
     if(!HttpEpollHandlerBufEquals(handler, WEBSOCKET_URL)) {
-      LOG_ERROR("Unknown URL '%.*s'", (int)handler->buf.savedContentLength, handler->buf.array);
+      LOG_ERROR("Unknown URL '%.*s'", (int)handler->data.http.buf.savedContentLength, handler->data.http.buf.array);
       return 1;
     }
 
     LOG_DEBUG("Got valid url %s", WEBSOCKET_URL);
-    handler->buf.savedContentLength = 0; // Remove the url
-    handler->buf.droppedContentLength = 0;
-    handler->state = newState;
-  } else if(handler->state >= HTTP_PROCESS_STATE_HEADER_VALUE_FIRST &&
-	    handler->state <= HTTP_PROCESS_STATE_HEADER_VALUE_LAST) {
+    handler->data.http.buf.savedContentLength = 0; // Remove the url
+    handler->data.http.buf.droppedContentLength = 0;
+    handler->data.http.state = newState;
+  } else if(handler->data.http.state >= HTTP_PROCESS_STATE_HEADER_VALUE_FIRST &&
+	    handler->data.http.state <= HTTP_PROCESS_STATE_HEADER_VALUE_LAST) {
 
-    LOG_DEBUG("HttpHeaderValue '%.*s%s'", (int)handler->buf.savedContentLength, handler->buf.array,
-	      handler->buf.droppedContentLength ? "..." : "");
-    handler->buf.savedContentLength = 0; // Remove the url
-    handler->buf.droppedContentLength = 0;
+    LOG_DEBUG("HttpHeaderValue '%.*s%s'", (int)handler->data.http.buf.savedContentLength, handler->data.http.buf.array,
+	      handler->data.http.buf.droppedContentLength ? "..." : "");
+    handler->data.http.buf.savedContentLength = 0; // Remove the url
+    handler->data.http.buf.droppedContentLength = 0;
     
-    if(handler->state == HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY) {
+    if(handler->data.http.state == HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY) {
       // Finish websocket key
-      Sha1_AddString(&handler->sha, WebSocketKeyPostfix);
-      Sha1_Finish(&handler->sha);
-      handler->state = newState;
+      Sha1_AddString(&handler->data.http.sha, WebSocketKeyPostfix);
+      Sha1_Finish(&handler->data.http.sha);
+      handler->data.http.state = newState;
     }
 
-    handler->state = newState;
+    handler->data.http.state = newState;
   }
 
   return 0;
@@ -331,8 +351,8 @@ int httpParserOnHeaderField(http_parser* parser, const char* at, size_t length)
     }
   }
 
-  if(handler->state != HTTP_PROCESS_STATE_HEADER_FIELD) {
-    LOG_ERROR("at header field callback but current state is %d", handler->state);
+  if(handler->data.http.state != HTTP_PROCESS_STATE_HEADER_FIELD) {
+    LOG_ERROR("at header field callback but current state is %d", handler->data.http.state);
     return 1;
   }
 
@@ -347,29 +367,29 @@ int httpParserOnHeaderValue(http_parser* parser, const char* at, size_t length)
 
   //LOG_DEBUG("http-parser: header-value '%.*s'", (int)length, at);
 
-  if(handler->state == HTTP_PROCESS_STATE_HEADER_FIELD) {
-    LOG_DEBUG("HttpHeaderField '%.*s%s'", (int)handler->buf.savedContentLength, handler->buf.array,
-	      handler->buf.droppedContentLength ? "..." : "");
+  if(handler->data.http.state == HTTP_PROCESS_STATE_HEADER_FIELD) {
+    LOG_DEBUG("HttpHeaderField '%.*s%s'", (int)handler->data.http.buf.savedContentLength, handler->data.http.buf.array,
+	      handler->data.http.buf.droppedContentLength ? "..." : "");
     if(HttpEpollHandlerBufEquals(handler, "Sec-WebSocket-Key")) {
       LOG_DEBUG("Found WebSocket Key!");
-      handler->state = HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY;
-      more_Sha1_Init(&handler->sha);
+      handler->data.http.state = HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY;
+      more_Sha1_Init(&handler->data.http.sha);
     } else {
-      handler->state = HTTP_PROCESS_STATE_HEADER_VALUE_GENERIC;
+      handler->data.http.state = HTTP_PROCESS_STATE_HEADER_VALUE_GENERIC;
     }
-    handler->buf.savedContentLength = 0; // Remove the header
-    handler->buf.droppedContentLength = 0;
+    handler->data.http.buf.savedContentLength = 0; // Remove the header
+    handler->data.http.buf.droppedContentLength = 0;
   }
 
-  if(handler->state == HTTP_PROCESS_STATE_HEADER_VALUE_GENERIC) {
+  if(handler->data.http.state == HTTP_PROCESS_STATE_HEADER_VALUE_GENERIC) {
     HttpEpollHandlerAdd(handler, at, length);
     return 0;
-  } else if(handler->state == HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY) {
+  } else if(handler->data.http.state == HTTP_PROCESS_STATE_HEADER_VALUE_WEBSOCKET_KEY) {
     HttpEpollHandlerAdd(handler, at, length);
-    Sha1_AddBinary(&handler->sha, at, length);
+    Sha1_AddBinary(&handler->data.http.sha, at, length);
     return 0;
   } else {
-    LOG_ERROR("at header value callback but current state is %d", handler->state);
+    LOG_ERROR("at header value callback but current state is %d", handler->data.http.state);
     return 1;
   }
 }

@@ -1,9 +1,12 @@
 HTTP=../http-parser
-MOREC=../morec/more
+MOREC=../morec
 CC=gcc -I ${MOREC}
 
-websocketserver: ${MOREC}/sha1.o ${MOREC}/base64.o ${HTTP}/http_parser.o net.o websocket.c
-	${CC} -o $@ -I . -I ${HTTP} $^
+websocketserver: ${MOREC}/more/sha1.o ${MOREC}/more/base64.o ${HTTP}/http_parser.o net.o websocketFrameParser.c websocket.c
+	${CC} -o $@ -I . -I ${HTTP} -I ${MOREC} $^
+
+websocketFrameParser.o: websocketFrameParser.c
+	${CC} -o $@ -I . -I ${MOREC} $^
 
 net.o: net.c net.h
 	${CC} -o $@ -c $<
@@ -14,9 +17,9 @@ net.o: net.c net.h
 #weblib/base64.o: weblib/base64.c
 #	${CC} -o $@ -c $<
 
-#sha1.o: ${MOREC}/sha1.c
+#sha1.o: ${MOREC}/more/sha1.c
 #	${CC} -o $@ -c $^
-#base64.o: ${MOREC}/base64.c
+#base64.o: ${MOREC}/more/base64.c
 #	${CC} -o $@ -c $^
 
 clean:
